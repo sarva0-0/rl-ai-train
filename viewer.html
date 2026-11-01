@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rl-ai-train replay viewer</title>
+<style>
+:root{color-scheme:dark;--bg:#15181b;--panel:#1b1f23;--line:#333a41;--text:#d9dee3;--dim:#8d96a0;--ok:#53b06f;--warn:#e0a23a;--bad:#e5645c;--acc:#4f8fdd}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,sans-serif}
+header{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:10px 16px;border-bottom:2px solid var(--acc)}
+h1{margin:0;font-size:15px;font-weight:600}
+#meta,td,.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+#meta{color:var(--dim);font-size:12px}
+main{display:grid;grid-template-columns:minmax(0,640px) minmax(0,1fr);gap:16px;padding:16px}
+main>div{display:grid;gap:16px;align-content:start}
+@media(max-width:900px){main{grid-template-columns:1fr}}
+section{background:var(--panel);border:1px solid var(--line)}
+h2{margin:0;padding:6px 12px;font-size:13px;font-weight:600;color:var(--dim);border-bottom:1px solid var(--line)}
+.b{padding:10px 12px}
+canvas{width:100%;display:block;background:#0f1214;border:1px solid var(--line)}
+.ctl{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;margin-top:10px}
+select,button{background:#0f1214;color:var(--text);border:1px solid var(--line);font:inherit;padding:3px 8px}
+button{cursor:pointer}button:hover{border-color:var(--acc)}
+input[type=range]{flex:1;min-width:140px}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{padding:2px 6px;border-bottom:1px solid var(--line);text-align:left;font-weight:400}
+th{color:var(--dim)}
+#ct tr[data-i]{cursor:pointer}#ct tr[data-i]:hover{background:#242a30}#ct tr.sel{background:#1f3047}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+.note{margin:6px 0 0;color:var(--dim);font-size:12px}
+:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+</style>
+</head>
+<body>
+<header><h1>rl-ai-train: lander replay viewer</h1><span id="meta"></span></header>
+<main>
+  <div>
+    <section>
+      <h2>Flight replay</h2>
+      <div class="b">
+        <canvas id="cv" width="600" height="400"></canvas>
+        <div class="ctl">
+          <label>Checkpoint <select id="ck"></select></label>
+          <label>Replay <select id="sd"></select></label>
+          <button id="pl" style="min-width:64px">Play</button>
+          <input id="fr" type="range" min="0" value="0" aria-label="Frame">
+        </div>
+        <p class="note">The drawing uses the simulator scale. Leg and hull shapes are simplified. The simulator calls action 1 the left engine. Its measured effect is a nose-left rotation.</p>
+      </div>
+    </section>
+    <section>
+      <h2>Landing rate by checkpoint (select a point on the chart)</h2>
+      <div class="b">
+        <canvas id="ch" width="600" height="140"></canvas>
+        <p class="note"><span class="ok">Green</span>: landed on the pad. <span class="warn">Amber</span>: landed anywhere. Blue line: selected checkpoint.</p>
+      </div>
+    </section>
+  </div>
+  <div>
+    <section><h2>Telemetry</h2><div class="b"><table id="tm"></table>
+      <p class="note">Position and velocity use the simulator's normalized units. The pad spans X = -0.2 to 0.2.</p></div></section>
+    <section><h2>Outcome</h2><div class="b"><p id="dg" style="margin:0"></p></div></section>
+    <section>
+      <h2>Checkpoints</h2>
+      <div class="b">
+        <div class="ctl" style="margin:0 0 8px">
+          <button id="j1">First on-pad landing</button>
+          <button id="j2">First 80% on-pad</button>
+          <button id="j3">Best mean score</button>
+          <label>Show <select id="fl"><option value="all">All checkpoints</option><option value="land">With landings only</option></select></label>
+        </div>
+        <p class="note" id="jm" style="margin:0 0 6px"></p>
+        <table id="ct"></table>
+        <p class="note">Iteration = checkpoint steps divided by 16,384 steps for each PPO update.</p>
+      </div>
+    </section>
+  </div>
+</main>
+<script src="replays.js"></script>
+<script>
+(function () {
+  const $ = id => document.getElementById(id);
+  if (typeof REPLAYS === "undefined") {
+    document.querySelector("main").textContent = "File replays.js not found. Run record_replays.py first.";
+    return;
+  }
+  const C = REPLAYS.checkpoints, FPS = 50, ITER = 16384;
+  const CMD = ["None", "Rotate nose left (action 1)", "Main engine (action 2)", "Rotate nose right (action 3)"];
+  const NAME = {LANDED: "Landed on pad", LANDED_OFF_PAD: "Landed off pad", CRASH: "Crash", OUT_OF_BOUNDS: "Out of bounds", TIMEOUT: "Timeout"};
+  const WHY = {
+    LANDED: "The lander came to rest on the pad.",
+    LANDED_OFF_PAD: "The lander came to rest outside the pad.",
+    CRASH: "The lander body touched the ground.",
+    OUT_OF_BOUNDS: "The lander left the screen.",
+    TIMEOUT: "The lander did not come to rest before the 1,000-step limit."
+  };
+  const n = Object.values(C[0].counts).reduce((a, b) => a + b, 0);
+  const cnt = (c, k) => c.counts[k] || 0, rate = (c, k) => cnt(c, k) / n;
+  const fmt = v => v.toLocaleString("en-US");
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let ci = C.length - 1, si = 0, f = 0, timer = null, fired = false, fx = [], raf = 0;
+  const run = () => C[ci].runs[si];
+  const pos = p => [300 + 300 * p[0], 282 - 200 * p[1]];
+
+  $("meta").textContent = `${C.length} checkpoints | ${n} seeds each | ${C[0].runs.length} replays each | ${FPS} frames/s`;
+  $("ck").innerHTML = C.map((c, i) => `<option value="${i}">${fmt(c.steps)} steps</option>`).join("");
+  $("ct").innerHTML = "<tr><th>Iter</th><th>Steps</th><th>On pad</th><th>Off pad</th><th>Crash</th><th>Out</th><th>Timeout</th><th>Score</th></tr>" +
+    C.map((c, i) => `<tr data-i="${i}"><td>${Math.floor(c.steps / ITER)}</td><td>${fmt(c.steps)}</td><td>${cnt(c, "LANDED")}</td><td>${cnt(c, "LANDED_OFF_PAD")}</td><td>${cnt(c, "CRASH")}</td><td>${cnt(c, "OUT_OF_BOUNDS")}</td><td>${cnt(c, "TIMEOUT")}</td><td>${c.mean_score.toFixed(1)}</td></tr>`).join("");
+
+  function lander(g, p) {
+    const q = pos(p), fl = 4 + Math.random() * 6;
+    g.save(); g.translate(q[0], q[1]); g.rotate(-p[4]); g.lineWidth = 2; g.lineJoin = "round";
+    [[-1, p[5]], [1, p[6]]].forEach(([s, on]) => {
+      g.strokeStyle = on ? "#53b06f" : "#8d96a0"; g.beginPath();
+      g.moveTo(s * 14, 10); g.lineTo(s * 24, 18); g.moveTo(s * 28, 18); g.lineTo(s * 20, 18); g.stroke();
+    });
+    g.fillStyle = "#2a3138"; g.strokeStyle = "#d9dee3"; g.beginPath();
+    [[-14, -17], [-17, 0], [-17, 10], [17, 10], [17, 0], [14, -17]].forEach((v, i) => g[i ? "lineTo" : "moveTo"](v[0], v[1]));
+    g.closePath(); g.fill(); g.stroke();
+    g.fillStyle = "#e0a23a"; g.beginPath();
+    if (p[7] === 2) { g.moveTo(-6, 10); g.lineTo(6, 10); g.lineTo(0, 24 + fl * 2); }
+    if (p[7] === 1) { g.moveTo(17, -16); g.lineTo(17, -10); g.lineTo(26 + fl, -13); }
+    if (p[7] === 3) { g.moveTo(-17, -16); g.lineTo(-17, -10); g.lineTo(-26 - fl, -13); }
+    g.fill(); g.restore();
+  }
+
+  function draw() {
+    const fr = run().frames, g = $("cv").getContext("2d");
+    g.clearRect(0, 0, 600, 400);
+    g.font = "11px ui-monospace,Menlo,monospace"; g.lineWidth = 1; g.strokeStyle = "#232930"; g.fillStyle = "#8d96a0";
+    for (let v = -1; v <= 1; v += 0.5) { g.beginPath(); g.moveTo(300 + 300 * v, 0); g.lineTo(300 + 300 * v, 300); g.stroke(); g.fillText(v.toFixed(1), 291 + 300 * v, 316); }
+    for (let v = 0.5; v <= 1.5; v += 0.5) { g.beginPath(); g.moveTo(0, 282 - 200 * v); g.lineTo(600, 282 - 200 * v); g.stroke(); g.fillText(v.toFixed(1), 4, 279 - 200 * v); }
+    g.fillText("X (normalized)", 255, 336); g.fillText("Altitude", 4, 12);
+    g.strokeStyle = "#8d96a0"; g.beginPath(); g.moveTo(0, 300); g.lineTo(600, 300); g.stroke();
+    g.strokeStyle = "#53b06f"; g.lineWidth = 4; g.beginPath(); g.moveTo(240, 300); g.lineTo(360, 300); g.stroke();
+    g.lineWidth = 1.5; [240, 360].forEach(x => { g.beginPath(); g.moveTo(x, 300); g.lineTo(x, 276); g.stroke(); });
+    g.strokeStyle = "#4f8fdd"; g.beginPath();
+    for (let i = 0; i <= f; i++) { const q = pos(fr[i]); g[i ? "lineTo" : "moveTo"](q[0], q[1]); }
+    g.stroke();
+    lander(g, fr[f]);
+    fx.forEach(o => {
+      g.globalAlpha = 1 - o.age / o.life; g.fillStyle = o.col;
+      if (o.star) {
+        g.save(); g.translate(o.x, o.y); g.rotate(o.rot + o.age * 0.05); g.beginPath();
+        for (let i = 0; i < 10; i++) { const r = i % 2 ? 2.5 : 6, a = i * Math.PI / 5; g[i ? "lineTo" : "moveTo"](Math.sin(a) * r, -Math.cos(a) * r); }
+        g.closePath(); g.fill(); g.restore();
+      } else g.fillRect(o.x - 1.5, o.y - 1.5, 3, 3);
+    });
+    g.globalAlpha = 1;
+  }
+
+  function burst() {
+    const r = run();
+    if (reduce || r.outcome === "TIMEOUT") return;
+    const q = pos(r.frames[r.frames.length - 1]), crash = r.outcome === "CRASH" || r.outcome === "OUT_OF_BOUNDS";
+    const k = crash ? 70 : r.outcome === "LANDED" ? 30 : 10;
+    for (let i = 0; i < k; i++) {
+      const a = Math.random() * 6.283, s = 0.8 + Math.random() * (crash ? 4.5 : 3);
+      fx.push({x: q[0], y: q[1] - (crash ? 0 : 10), vx: Math.cos(a) * s, vy: Math.sin(a) * s - (crash ? 0 : 1.5),
+        life: (crash ? 40 : 80) + Math.random() * 30, age: 0, star: !crash, rot: Math.random() * 6,
+        col: crash ? ["#e5645c", "#e0a23a", "#d9dee3"][i % 3] : "#f0c24b"});
+    }
+    if (!raf) raf = requestAnimationFrame(tick);
+  }
+  function tick() {
+    fx.forEach(o => { o.x += o.vx; o.y += o.vy; o.vy += o.star ? 0.04 : 0.06; o.age++; });
+    fx = fx.filter(o => o.age < o.life); draw();
+    raf = fx.length ? requestAnimationFrame(tick) : 0;
+  }
+
+  function chart() {
+    const g = $("ch").getContext("2d"), W = 600, H = 140, L = 40, T = 8, B = 22;
+    const X = i => L + (W - L - 10) * i / Math.max(1, C.length - 1), Y = v => T + (H - T - B) * (1 - v);
+    g.clearRect(0, 0, W, H); g.font = "11px ui-monospace,Menlo,monospace"; g.fillStyle = "#8d96a0"; g.strokeStyle = "#262c32"; g.lineWidth = 1;
+    [0, 0.5, 1].forEach(v => { g.beginPath(); g.moveTo(L, Y(v)); g.lineTo(W - 10, Y(v)); g.stroke(); g.fillText(Math.round(v * 100) + "%", 4, Y(v) + 4); });
+    C.forEach((c, i) => { if (i % Math.ceil(C.length / 6) === 0) g.fillText(Math.round(c.steps / 1000) + "k", X(i) - 10, H - 6); });
+    const line = (key, col) => { g.strokeStyle = col; g.lineWidth = 2; g.beginPath(); C.forEach((c, i) => g[i ? "lineTo" : "moveTo"](X(i), Y(key(c)))); g.stroke(); };
+    line(c => rate(c, "LANDED") + rate(c, "LANDED_OFF_PAD"), "#e0a23a");
+    line(c => rate(c, "LANDED"), "#53b06f");
+    g.strokeStyle = "#4f8fdd"; g.lineWidth = 1; g.beginPath(); g.moveTo(X(ci), T); g.lineTo(X(ci), H - B); g.stroke();
+  }
+
+  function render() {
+    const fr = run().frames, p = fr[f], last = fr.length - 1;
+    const row = (k, v) => `<tr><th>${k}</th><td>${v}</td></tr>`, yn = v => (v ? "yes" : "no");
+    $("fr").value = f;
+    $("tm").innerHTML = row("Step", `${f} / ${last}`) + row("Time", (f / FPS).toFixed(2) + " s") +
+      row("X", p[0].toFixed(3)) + row("Altitude", p[1].toFixed(3)) + row("Velocity X", p[2].toFixed(3)) +
+      row("Velocity Y", p[3].toFixed(3)) + row("Tilt", (p[4] * 180 / Math.PI).toFixed(1) + " deg") +
+      row("Leg contact", `L ${yn(p[5])}, R ${yn(p[6])}`) + row("Command", CMD[p[7]]);
+    if (f === last && !fired) { fired = true; burst(); } else if (f < last) { fired = false; fx = []; }
+    draw();
+  }
+
+  function load() {
+    stop(); f = 0; fired = false; fx = [];
+    $("ck").value = ci;
+    $("sd").innerHTML = C[ci].runs.map((r, i) => `<option value="${i}">Seed ${r.seed}: ${NAME[r.outcome]}</option>`).join("");
+    $("sd").value = si;
+    const r = run(), fr = r.frames, l = fr[fr.length - 1];
+    const cls = r.outcome === "LANDED" ? "ok" : r.outcome === "CRASH" || r.outcome === "OUT_OF_BOUNDS" ? "bad" : "warn";
+    $("fr").max = fr.length - 1;
+    $("dg").innerHTML = `<b class="${cls}">${NAME[r.outcome]}.</b> ${WHY[r.outcome]}<br>` +
+      `Score ${r.score.toFixed(1)}. Steps ${fr.length - 1}. Final command: ${CMD[l[7]]}.<br>` +
+      `Final state: X ${l[0].toFixed(2)}, tilt ${(l[4] * 57.296).toFixed(1)} deg, Vx ${l[2].toFixed(2)}, Vy ${l[3].toFixed(2)}, legs L ${l[5] ? "yes" : "no"} / R ${l[6] ? "yes" : "no"}.`;
+    [...$("ct").rows].forEach((tr, j) => tr.classList.toggle("sel", j - 1 === ci));
+    chart(); render();
+  }
+
+  function stop() { clearInterval(timer); timer = null; $("pl").textContent = "Play"; }
+  function play() {
+    if (f >= run().frames.length - 1) { f = 0; fired = false; fx = []; }
+    $("pl").textContent = "Pause";
+    timer = setInterval(() => { if (f >= run().frames.length - 1) return stop(); f++; render(); }, 20);
+  }
+  function jump(test, msg) {
+    const i = C.findIndex(test);
+    $("jm").textContent = i < 0 ? msg : "";
+    if (i >= 0) { ci = i; load(); }
+  }
+
+  $("ck").onchange = e => { ci = +e.target.value; load(); };
+  $("sd").onchange = e => { si = +e.target.value; load(); };
+  $("fr").oninput = e => { f = +e.target.value; render(); };
+  $("pl").onclick = () => (timer ? stop() : play());
+  $("ct").onclick = e => { const tr = e.target.closest("tr[data-i]"); if (tr) { ci = +tr.dataset.i; load(); } };
+  $("ch").onclick = e => {
+    const b = e.target.getBoundingClientRect(), x = (e.clientX - b.left) / b.width * 600;
+    ci = Math.max(0, Math.min(C.length - 1, Math.round((x - 40) / 550 * (C.length - 1)))); load();
+  };
+  $("j1").onclick = () => jump(c => cnt(c, "LANDED") > 0, "No on-pad landing in the tested seeds.");
+  $("j2").onclick = () => jump(c => rate(c, "LANDED") >= 0.8, "No checkpoint reached 80% on-pad landings.");
+  $("j3").onclick = () => { ci = C.reduce((b, c, i) => (c.mean_score > C[b].mean_score ? i : b), 0); load(); };
+  $("fl").onchange = e => {
+    [...$("ct").rows].forEach((tr, j) => {
+      const c = C[j - 1]; if (c) tr.style.display = e.target.value === "land" && !cnt(c, "LANDED") && !cnt(c, "LANDED_OFF_PAD") ? "none" : "";
+    });
+  };
+  load();
+})();
+</script>
+</body>
+</html>
