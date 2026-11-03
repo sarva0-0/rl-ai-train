@@ -2,3 +2,4 @@ gymnasium[box2d]
 stable-baselines3
 tensorboard
 pytest
+matplotlib
